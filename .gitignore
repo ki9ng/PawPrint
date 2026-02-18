@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+stations.json
+tracks.json
+*.sqlite
+*.db
