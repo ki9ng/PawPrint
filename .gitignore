@@ -1,7 +1,25 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Data files — these are runtime-generated on the Pi, not part of the repo
+data/
+static/
+
+# Editor / OS
+.DS_Store
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets / local config overrides
+*.env
+.env
+
+# Logs
 *.log
-stations.json
-tracks.json
-*.sqlite
-*.db

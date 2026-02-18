@@ -432,6 +432,16 @@
       </div>
 
       <div class="settings-card">
+        <h3>Heard Stations</h3>
+        <div class="form-row">
+          <label>Cull stations older than (days)</label>
+          <input type="number" id="cfg-station-age" value="7" min="1" max="30" step="1">
+          <div class="form-hint">Stations not heard within this window are dropped on next restart.</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="applyStationAge()">Apply</button>
+      </div>
+
+      <div class="settings-card">
         <h3>SmartBeaconing</h3>
         <div class="form-hint" style="margin-bottom:10px;">
           fast_speed fast_rate slow_speed slow_rate min_turn turn_angle max_rate
@@ -548,6 +558,17 @@ function connectSSE() {
     stations[s.callsign] = s;
     renderList();
     updateMapMarker(s);
+    updateStationCount();
+  });
+
+  es.addEventListener("station_remove", e => {
+    const { callsign } = JSON.parse(e.data);
+    delete stations[callsign];
+    if (markers[callsign]) {
+      markers[callsign].remove();
+      delete markers[callsign];
+    }
+    renderList();
     updateStationCount();
   });
 
@@ -1275,6 +1296,7 @@ function loadConfig() {
       fetch(BASE + "/api/status").then(r=>r.json()).then(s => {
         filterRadius = s.filter_radius || 50;
         document.getElementById("cfg-filter-radius").value = filterRadius;
+        document.getElementById("cfg-station-age").value = s.station_max_age_days || 7;
 
         // Status info
         const ai = s.aprs_is_connected;
@@ -1306,6 +1328,22 @@ function applyFilterRadius() {
     drawFilterCircle();
     toast(`Filter radius set to ${r} km`, "success");
   });
+}
+
+function applyStationAge() {
+  const d = parseInt(document.getElementById("cfg-station-age").value);
+  if (!d || d < 1 || d > 30) { toast("Age must be 1–30 days", "error"); return; }
+  fetch(BASE + "/api/config", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({ station_max_age_days: d })
+  }).then(r => r.json()).then(res => {
+    if (res.ok !== false) {
+      toast(`Station age set to ${d} day${d !== 1 ? "s" : ""} — stale stations removed`, "success");
+    } else {
+      toast("Failed to save: " + (res.error || "unknown"), "error");
+    }
+  }).catch(() => toast("Save failed", "error"));
 }
 
 function saveConfig() {

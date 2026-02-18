@@ -9,7 +9,7 @@ It shows heard stations on a map, tracks your own position, and lets you send AP
 
 **Operator**: KI9NG-10, AllStarLink Node 604011  
 **URL**: `https://604011.ki9ng.com/pawprint`  
-**Version**: 2.2
+**Version**: 2.3
 
 ## System Layout
 
@@ -82,6 +82,18 @@ If you change the web path, update both:
 **Cause 2 — [ig] only**: The regex matched only `[ig]` (iGated packets). Direwolf also logs RF transmits as `[0L]`, `[0H]`, etc. If APRS-IS is down or the packet was RF-only, position was never captured.  
 **Cause 3 — ! only**: The regex required `!` as the position type identifier. Direwolf TBEACON/SMARTBEACONING also uses `=` and `@`.  
 **Fix**: On startup, `try_seed_from_log()` scans the last 200 lines of the existing log (most-recent-first) and seeds `own_position` immediately. The live-tail regex now matches any channel `[\S+]` and all position type identifiers `[!=@]`.
+
+## Known Bugs (Fixed in v2.3)
+
+### Station cull only fired at startup
+**Symptom**: Reducing `station_max_age_days` in Settings had no immediate effect — stale stations stayed on map and list until next restart  
+**Cause**: `load_stations()` filtered by age at load time, but there was no mechanism to evict stations from the live in-memory state  
+**Fix**: Added `cull_stations()` which evicts stale stations from `state["stations"]`, pushes a `station_remove` SSE event per evicted callsign, and saves to disk. Called immediately when `station_max_age_days` changes via the API, and by a new `cull_loop()` background thread that runs every hour. Frontend handles `station_remove` events by deleting from the `stations{}` dict, removing the Leaflet marker, and refreshing the list.
+
+### filter_radius reset to 50 km on every restart
+**Symptom**: After setting a custom APRS-IS filter radius in Settings, the value reverted to 50 km whenever the service restarted  
+**Cause**: `filter_radius` was only held in memory — never persisted  
+**Fix**: Both `station_max_age_days` and `filter_radius` are now saved to `/var/lib/pawprint/pawprint.json` and loaded by `load_pawprint_cfg()` before `load_stations()` runs in `startup()`.
 
 ## Known Bugs (Fixed in v2.2)
 
@@ -232,4 +244,4 @@ sudo strings /var/log/direwolf/direwolf_console.log | grep -i "gps\|fix\|timeout
 MIT
 
 ---
-*Last updated: 2026-02-17 (v2.2 — erratic position fix, duplicate track fix, BASE path fix, beacon_now fix, update.sh)*
+*Last updated: 2026-02-18 (v2.3 — realtime station cull, filter_radius persistence, cull_loop background thread)*

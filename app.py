@@ -33,6 +33,7 @@ DATA_DIR        = Path("/var/lib/pawprint")
 STATIONS_FILE   = DATA_DIR / "stations.json"
 MESSAGES_FILE   = DATA_DIR / "messages.json"
 TRACKS_FILE     = DATA_DIR / "tracks.json"
+PAWPRINT_CFG    = DATA_DIR / "pawprint.json"
 
 def _resolve_data_dir():
     """Use /var/lib/pawprint if writable, otherwise fall back to ./data next to app.py."""
@@ -49,6 +50,7 @@ def _resolve_data_dir():
         STATIONS_FILE = DATA_DIR / "stations.json"
         MESSAGES_FILE = DATA_DIR / "messages.json"
         TRACKS_FILE   = DATA_DIR / "tracks.json"
+        PAWPRINT_CFG  = DATA_DIR / "pawprint.json"
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 VOICEAPRS_LOG   = Path("/var/log/voiceaprs-messages.log")
 MAX_STATIONS    = 500
@@ -74,14 +76,15 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_prefix=1)
 # ─── Shared State ─────────────────────────────────────────────────────────────
 
 state = {
-    "stations":       {},      # callsign -> station dict
-    "messages":       [],      # received/sent APRS messages
-    "own_position":   None,    # {"lat": float, "lon": float}
-    "filter_radius":  DEFAULT_FILTER_RADIUS,
-    "filter_center":  None,    # {"lat": float, "lon": float} last filter sent
-    "aprs_is_connected": False,
-    "agw_connected":  False,
-    "tracks":         {},      # callsign -> list of {lat,lon,ts}
+    "stations":            {},      # callsign -> station dict
+    "messages":            [],      # received/sent APRS messages
+    "own_position":        None,    # {"lat": float, "lon": float}
+    "filter_radius":       DEFAULT_FILTER_RADIUS,
+    "filter_center":       None,    # {"lat": float, "lon": float} last filter sent
+    "aprs_is_connected":   False,
+    "agw_connected":       False,
+    "tracks":              {},      # callsign -> list of {lat,lon,ts}
+    "station_max_age_days": 7,      # cull stations not heard within this many days
 }
 state_lock = threading.Lock()
 
@@ -97,6 +100,38 @@ msg_seq_lock = threading.Lock()
 def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+def load_pawprint_cfg():
+    """Load Pawprint-specific settings from pawprint.json and apply to state.
+    Falls back to defaults if the file doesn't exist yet.
+    """
+    try:
+        with open(PAWPRINT_CFG) as f:
+            cfg = json.load(f)
+        with state_lock:
+            if "station_max_age_days" in cfg:
+                state["station_max_age_days"] = max(1, int(cfg["station_max_age_days"]))
+            if "filter_radius" in cfg:
+                state["filter_radius"] = max(10, int(cfg["filter_radius"]))
+        log.info("Loaded pawprint config: station_max_age_days=%d filter_radius=%d",
+                 state["station_max_age_days"], state["filter_radius"])
+    except FileNotFoundError:
+        pass  # first run — defaults stay in place
+    except Exception as e:
+        log.warning("Could not load pawprint config: %s", e)
+
+def save_pawprint_cfg():
+    """Persist Pawprint-specific settings to pawprint.json."""
+    with state_lock:
+        cfg = {
+            "station_max_age_days": state["station_max_age_days"],
+            "filter_radius":        state["filter_radius"],
+        }
+    try:
+        with open(PAWPRINT_CFG, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        log.warning("Could not save pawprint config: %s", e)
+
 def load_stations():
     if not STATIONS_FILE.exists():
         return
@@ -105,9 +140,10 @@ def load_stations():
             data = json.load(f)
         now = time.time()
         with state_lock:
+            max_age = state["station_max_age_days"] * 86400
             for call, s in data.items():
                 age = now - s.get("last_heard_ts", 0)
-                if age < STATION_MAX_AGE:
+                if age < max_age:
                     state["stations"][call] = s
         log.info("Loaded %d stations from disk", len(state["stations"]))
     except Exception as e:
@@ -129,6 +165,38 @@ def save_stations():
             json.dump(stations, f)
     except Exception as e:
         log.warning("Could not save stations: %s", e)
+
+def cull_stations():
+    """Remove stations older than station_max_age_days from the live state,
+    push a station_remove SSE event for each one, then persist to disk.
+    Safe to call at any time — from the API handler or the background cull thread.
+    Returns the number of stations removed.
+    """
+    with state_lock:
+        max_age = state["station_max_age_days"] * 86400
+        cutoff  = time.time() - max_age
+        stale   = [call for call, s in state["stations"].items()
+                   if s.get("last_heard_ts", 0) < cutoff]
+        for call in stale:
+            del state["stations"][call]
+
+    for call in stale:
+        push_event("station_remove", {"callsign": call})
+
+    if stale:
+        log.info("Culled %d stale station(s): %s", len(stale), ", ".join(stale))
+        save_stations()
+
+    return len(stale)
+
+def cull_loop():
+    """Background thread: cull stale stations once per hour."""
+    while True:
+        time.sleep(3600)
+        try:
+            cull_stations()
+        except Exception as e:
+            log.warning("cull_loop error: %s", e)
 
 def load_messages():
     if not MESSAGES_FILE.exists():
@@ -388,7 +456,7 @@ def aprs_is_thread():
             # Login
             login_str = (
                 f"user {MYCALL} pass {APRS_IS_PASS} "
-                f"vers pawprint 2.2 filter r/41.54/-87.14/{DEFAULT_FILTER_RADIUS}\r\n"
+                f"vers pawprint 2.3 filter r/41.54/-87.14/{DEFAULT_FILTER_RADIUS}\r\n"
             )
             sock.sendall(login_str.encode())
             log.info("APRS-IS login sent")
@@ -737,12 +805,13 @@ def static_files(filename):
 def api_status():
     with state_lock:
         return jsonify({
-            "aprs_is_connected": state["aprs_is_connected"],
-            "agw_connected":     state["agw_connected"],
-            "station_count":     len(state["stations"]),
-            "own_position":      state["own_position"],
-            "filter_radius":     state["filter_radius"],
-            "filter_center":     state["filter_center"],
+            "aprs_is_connected":   state["aprs_is_connected"],
+            "agw_connected":       state["agw_connected"],
+            "station_count":       len(state["stations"]),
+            "own_position":        state["own_position"],
+            "filter_radius":       state["filter_radius"],
+            "filter_center":       state["filter_center"],
+            "station_max_age_days": state["station_max_age_days"],
         })
 
 @app.route("/api/stations")
@@ -814,7 +883,21 @@ def api_config():
 @app.route("/api/config", methods=["POST"])
 def api_config_post():
     updates = request.json or {}
-    result  = write_config(updates)
+    pawprint_cfg_changed = False
+
+    # Pawprint-specific settings — handled here, not written to direwolf.conf
+    if "station_max_age_days" in updates:
+        try:
+            days = max(1, int(updates["station_max_age_days"]))
+            with state_lock:
+                state["station_max_age_days"] = days
+            pawprint_cfg_changed = True
+            log.info("station_max_age_days updated to %d", days)
+            # Apply immediately — evict stale stations from live state right now
+            culled = cull_stations()
+            log.info("Immediate cull after age change: removed %d station(s)", culled)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "station_max_age_days must be an integer"}), 400
 
     # If filter radius changed, update state AND push new filter immediately
     if "filter_radius" in updates:
@@ -827,8 +910,22 @@ def api_config_post():
                 push_filter_now(pos["lat"], pos["lon"], r)
             else:
                 log.warning("Filter radius updated but no own_position yet — filter will apply on next position update")
+            pawprint_cfg_changed = True
         except ValueError:
             pass
+
+    # Persist Pawprint-specific settings whenever either value changed
+    if pawprint_cfg_changed:
+        save_pawprint_cfg()
+
+    # Only call write_config for keys that actually belong in direwolf.conf
+    direwolf_keys = {"symbol", "comment", "smartbeaconing", "igfilter"}
+    direwolf_updates = {k: v for k, v in updates.items() if k in direwolf_keys}
+    result = write_config(direwolf_updates) if direwolf_updates else {"ok": True}
+
+    # If it was a pawprint-only update (no direwolf keys), still return ok
+    if pawprint_cfg_changed and not direwolf_updates:
+        return jsonify({"ok": True})
 
     # Return the actual config read back from disk so the UI shows what was really saved
     if result.get("ok"):
@@ -1041,6 +1138,7 @@ def direwolf_log_thread():
 def startup():
     _resolve_data_dir()   # pick writable data dir before anything else
     ensure_data_dir()
+    load_pawprint_cfg()   # load station_max_age_days + filter_radius before loading stations
     load_stations()
     load_messages()
     load_tracks()
@@ -1060,6 +1158,10 @@ def startup():
     # Start GPSD monitoring thread if available
     t_log = threading.Thread(target=direwolf_log_thread, daemon=True, name="direwolf-log")
     t_log.start()
+
+    # Background hourly cull of stations that have aged out
+    t_cull = threading.Thread(target=cull_loop, daemon=True, name="station-cull")
+    t_cull.start()
 
     # Sprite download removed — sprites are embedded in HTML as base64
 

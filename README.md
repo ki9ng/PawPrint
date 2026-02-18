@@ -1,6 +1,6 @@
 # Pawprint APRS Web Interface
 
-**v2.2** — A mobile-friendly APRS web interface for Raspberry Pi running alongside Direwolf and AllStarLink 3. Monitor heard stations in real-time, track your GPS position on a map, send APRS messages, and configure beaconing from your browser.
+**v2.3** — A mobile-friendly APRS web interface for Raspberry Pi running alongside Direwolf and AllStarLink 3. Monitor heard stations in real-time, track your GPS position on a map, send APRS messages, and configure beaconing from your browser.
 
 ## Features
 
@@ -131,6 +131,12 @@ sudo bash update.sh
 `update.sh` automatically preserves your callsign, APRS passcode, and web path from the running installation, copies the new files, and restarts the service. A timestamped backup of your old `app.py` is saved to `/opt/pawprint/`.
 
 ## Changelog
+
+### v2.3
+- **Added: Configurable station age / heard-list culling** — New "Heard Stations" card in Settings lets you set how many days a station must be silent before it's removed (1–30 days, default 7).
+- **Added: Realtime station cull** — Changing the age limit in Settings evicts stale stations immediately from the live map and list via SSE `station_remove` events. No restart needed.
+- **Added: Hourly background cull** — A `cull_loop` thread runs every hour to evict stations that age out during long uptimes, even if the setting never changes.
+- **Fix: filter_radius reset to 50 km on restart** — APRS-IS filter radius and station age limit are now persisted in `/var/lib/pawprint/pawprint.json` and restored on startup.
 
 ### v2.2
 - **Fix: Erratic station jumping / wild green track lines on map** — The fallback APRS position parser used an unanchored `.` regex where the APRS symbol-table character belongs. This caused the regex to latch onto unrelated numeric sequences in packet comments, paths, or timestamps and produce completely fabricated coordinates. Fixed by using an explicit character class `[\/\\A-Za-z0-9]` that matches only valid APRS symbol table identifiers.
