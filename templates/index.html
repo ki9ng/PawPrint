@@ -925,8 +925,14 @@ function setTrackWindow(seconds) {
   refreshTracks();
 }
 
+let _refreshTracksTimer = null;
 function refreshTracks() {
   if (!leafletMap) return;
+  clearTimeout(_refreshTracksTimer);
+  _refreshTracksTimer = setTimeout(_doRefreshTracks, 300);
+}
+
+function _doRefreshTracks() {
   fetch(BASE + "/api/tracks?max_age=" + trackWindow)
     .then(r => r.json())
     .then(data => {

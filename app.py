@@ -554,11 +554,12 @@ def push_filter_now(lat, lon, radius):
         return False
 
 def maybe_update_filter(lat, lon):
+    """Send a #filter update to APRS-IS if position has moved enough to warrant it."""
     with state_lock:
-        fc = state.get("filter_center")
+        fc     = state.get("filter_center")
+        radius = state.get("filter_radius", DEFAULT_FILTER_RADIUS)
     if _should_update_filter({"lat": lat, "lon": lon}, fc):
-        with state_lock:
-            state["filter_center"] = {"lat": lat, "lon": lon}
+        push_filter_now(lat, lon, radius)  # push_filter_now updates filter_center on success
 
 # ─── AGW Thread (Send Only) ───────────────────────────────────────────────────
 
@@ -1155,7 +1156,11 @@ def direwolf_log_thread():
                             state["own_position"] = {"lat": lat, "lon": lon}
                         log.info("Beacon captured: %.5f, %.5f", lat, lon)
                         push_event("position", {"lat": lat, "lon": lon})
-                        add_track_point(MYCALL, lat, lon, time.time())
+                        now_ts = time.time()
+                        added = add_track_point(MYCALL, lat, lon, now_ts)
+                        if added:
+                            push_event("track_point", {"callsign": MYCALL, "lat": lat, "lon": lon, "ts": now_ts})
+                            save_tracks()
                         maybe_update_filter(lat, lon)
                 except Exception as e:
                     log.warning("Log parse error: %s", e)
