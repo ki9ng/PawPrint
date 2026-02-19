@@ -372,6 +372,7 @@
         <option value="call">Call</option>
         <option value="count">Active</option>
       </select>
+      <button class="btn btn-danger btn-sm" onclick="cullAll()" title="Remove all heard stations immediately">Cull All</button>
     </div>
     <div id="station-list">
       <div class="empty"><div class="empty-icon">📡</div><div class="empty-text">Waiting for stations…</div></div>
@@ -392,6 +393,7 @@
   <div class="view" id="view-map">
     <div id="map-toolbar">
       <span id="filter-radius-display">Filter: 50 km radius</span>
+      <span style="font-size:13px;color:var(--text2);white-space:nowrap;">Tracks:</span>
       <select id="track-window" onchange="setTrackWindow(this.value)" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 8px;font-size:13px;outline:none;">
         <option value="1800">30 min</option>
         <option value="3600">1 hour</option>
@@ -434,9 +436,21 @@
       <div class="settings-card">
         <h3>Heard Stations</h3>
         <div class="form-row">
-          <label>Cull stations older than (days)</label>
-          <input type="number" id="cfg-station-age" value="7" min="1" max="30" step="1">
-          <div class="form-hint">Stations not heard within this window are dropped on next restart.</div>
+          <label>Cull stations not heard within</label>
+          <select id="cfg-station-age" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);padding:6px 8px;font-size:13px;outline:none;width:100%">
+            <option value="1">1 hour</option>
+            <option value="2">2 hours</option>
+            <option value="4">4 hours</option>
+            <option value="8">8 hours</option>
+            <option value="12">12 hours</option>
+            <option value="24">1 day</option>
+            <option value="48">2 days</option>
+            <option value="72">3 days</option>
+            <option value="168" selected>7 days</option>
+            <option value="336">14 days</option>
+            <option value="720">30 days</option>
+          </select>
+          <div class="form-hint">Stations and their tracks are removed after this period of silence.</div>
         </div>
         <button class="btn btn-ghost btn-sm" onclick="applyStationAge()">Apply</button>
       </div>
@@ -568,8 +582,29 @@ function connectSSE() {
       markers[callsign].remove();
       delete markers[callsign];
     }
+    if (trackLines[callsign]) {
+      trackLines[callsign].remove();
+      delete trackLines[callsign];
+    }
     renderList();
     updateStationCount();
+  });
+
+  es.addEventListener("track_point", e => {
+    if (!leafletMap) return;
+    const { callsign, lat, lon, ts } = JSON.parse(e.data);
+    const cutoff = Date.now() / 1000 - trackWindow;
+    if (ts < cutoff) return; // outside current view window — ignore
+    const latlng = [lat, lon];
+    if (trackLines[callsign]) {
+      // Extend existing polyline in-place — no API call needed
+      const latlngs = trackLines[callsign].getLatLngs();
+      latlngs.push(latlng);
+      trackLines[callsign].setLatLngs(latlngs);
+    } else {
+      // First or second point for this station — full refresh to build the polyline
+      refreshTracks();
+    }
   });
 
   es.addEventListener("message", e => {
@@ -876,45 +911,6 @@ function updateStationCount(n) {
   const count = n != null ? n : Object.keys(stations).length;
   document.getElementById("station-count").textContent = count + " station" + (count !== 1 ? "s" : "");
 }
-
-// ── Track Rendering ────────────────────────────────────────────────────────
-function callsignColor(call) {
-  // Deterministic color from callsign — different hue per station
-  let hash = 0;
-  for (let i = 0; i < call.length; i++) hash = call.charCodeAt(i) + ((hash << 5) - hash);
-  const hue = Math.abs(hash) % 360;
-  // Keep saturation/lightness in a range that's visible on map tiles
-  return `hsl(${hue}, 85%, 52%)`;
-}
-
-function setTrackWindow(seconds) {
-  trackWindow = parseInt(seconds);
-  refreshTracks();
-}
-
-function refreshTracks() {
-  if (!leafletMap) return;
-  const maxAge = trackWindow;
-  fetch(BASE + "/api/tracks?max_age=" + maxAge)
-    .then(r => r.json())
-    .then(data => {
-      // Remove old track lines
-      Object.values(trackLines).forEach(l => leafletMap.removeLayer(l));
-      trackLines = {};
-      // Draw new ones
-      Object.entries(data).forEach(([call, pts]) => {
-        if (pts.length < 2) return;
-        const latlngs = pts.map(p => [p.lat, p.lon]);
-        const color   = callsignColor(call);
-        const line    = L.polyline(latlngs, {
-          color, weight: 2, opacity: 0.8, lineJoin: 'round'
-        }).addTo(leafletMap);
-        trackLines[call] = line;
-      });
-    })
-    .catch(() => {});
-}
-
 
 // ── Track Rendering ────────────────────────────────────────────────────────
 function callsignColor(call) {
@@ -1296,7 +1292,7 @@ function loadConfig() {
       fetch(BASE + "/api/status").then(r=>r.json()).then(s => {
         filterRadius = s.filter_radius || 50;
         document.getElementById("cfg-filter-radius").value = filterRadius;
-        document.getElementById("cfg-station-age").value = s.station_max_age_days || 7;
+        document.getElementById("cfg-station-age").value = s.station_max_age_hours || 168;
 
         // Status info
         const ai = s.aprs_is_connected;
@@ -1331,19 +1327,33 @@ function applyFilterRadius() {
 }
 
 function applyStationAge() {
-  const d = parseInt(document.getElementById("cfg-station-age").value);
-  if (!d || d < 1 || d > 30) { toast("Age must be 1–30 days", "error"); return; }
+  const h = parseInt(document.getElementById("cfg-station-age").value);
+  if (!h || h < 1) { toast("Invalid age selection", "error"); return; }
   fetch(BASE + "/api/config", {
     method: "POST",
     headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({ station_max_age_days: d })
+    body: JSON.stringify({ station_max_age_hours: h })
   }).then(r => r.json()).then(res => {
     if (res.ok !== false) {
-      toast(`Station age set to ${d} day${d !== 1 ? "s" : ""} — stale stations removed`, "success");
+      const label = h < 24 ? `${h} hour${h !== 1 ? "s" : ""}` : `${h/24} day${h/24 !== 1 ? "s" : ""}`;
+      toast(`Station age set to ${label} — stale stations removed`, "success");
     } else {
       toast("Failed to save: " + (res.error || "unknown"), "error");
     }
   }).catch(() => toast("Save failed", "error"));
+}
+
+function cullAll() {
+  if (!confirm("Remove all heard stations from the list? This cannot be undone.")) return;
+  fetch(BASE + "/api/cull_all", { method: "POST" })
+    .then(r => r.json())
+    .then(res => {
+      if (res.ok) {
+        toast(`Cleared ${res.removed} station${res.removed !== 1 ? "s" : ""}`, "success");
+      } else {
+        toast("Cull failed", "error");
+      }
+    }).catch(() => toast("Cull failed", "error"));
 }
 
 function saveConfig() {

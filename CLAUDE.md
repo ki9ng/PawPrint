@@ -9,7 +9,7 @@ It shows heard stations on a map, tracks your own position, and lets you send AP
 
 **Operator**: KI9NG-10, AllStarLink Node 604011  
 **URL**: `https://604011.ki9ng.com/pawprint`  
-**Version**: 2.3
+**Version**: 2.4
 
 ## System Layout
 
@@ -83,7 +83,29 @@ If you change the web path, update both:
 **Cause 3 — ! only**: The regex required `!` as the position type identifier. Direwolf TBEACON/SMARTBEACONING also uses `=` and `@`.  
 **Fix**: On startup, `try_seed_from_log()` scans the last 200 lines of the existing log (most-recent-first) and seeds `own_position` immediately. The live-tail regex now matches any channel `[\S+]` and all position type identifiers `[!=@]`.
 
+## Known Bugs (Fixed in v2.4)
+
+### Station cull window was days-only with no sub-day resolution
+**Symptom**: Minimum cull window was 1 day; no way to expire stations within hours  
+**Fix**: Renamed `station_max_age_days` to `station_max_age_hours` everywhere (state, pawprint.json, API, UI). Settings card replaced number input with a select dropdown: 1h, 2h, 4h, 8h, 12h, 1d, 2d, 3d, 7d, 14d, 30d. `load_pawprint_cfg()` auto-migrates old `station_max_age_days` values (multiplies by 24). All internal time math uses `state["station_max_age_hours"] * 3600`.
+
+### Tracks stored longer than their station
+**Symptom**: After a station was culled its track data remained in `state["tracks"]` and `tracks.json` indefinitely  
+**Fix 1 — cull_stations() cleanup**: Now deletes `state["tracks"][call]` for every evicted station and calls `save_tracks()`.  
+**Fix 2 — add_track_point() storage cutoff**: Uses `state["station_max_age_hours"] * 3600` instead of the old hardcoded `TRACK_MAX_AGE` constant (which was 7 days regardless of settings). Tracks now live exactly as long as their station.  
+**Fix 3 — load_tracks() cutoff**: Also uses `station_max_age_hours * 3600` so stale track data is dropped on startup.  
+**Fix 4 — api/tracks default**: The `/api/tracks` endpoint's default `max_age` parameter now derives from state rather than the removed constant.
+
+### No way to immediately clear the heard-stations list
+**Symptom**: No UI to wipe all stations at once without restarting the service or waiting for cull  
+**Fix**: Added `POST /api/cull_all` endpoint that clears `state["stations"]` and `state["tracks"]`, pushes `station_remove` SSE for each callsign, saves both files. Added "Cull All" button to the heard-stations toolbar with a confirmation prompt.
+
 ## Known Bugs (Fixed in v2.3)
+
+### Track polylines did not update in real time — new points invisible until track window toggled
+**Symptom**: After map loads, track polylines for heard stations are drawn correctly from history. But as new packets arrive, the polylines never extend — only old (pre-load) track history is visible. Toggling the track window dropdown forces a refresh and shows the missing points.  
+**Cause**: `add_track_point()` wrote new points to `state["tracks"]` and `save_tracks()` persisted them, but no SSE event was emitted. The only way the frontend called `refreshTracks()` was at `initMap()` time and on manual track-window changes. Also: `callsignColor()`, `setTrackWindow()`, and `refreshTracks()` were defined twice in index.html — the duplicate block was dead code but a source of confusion.  
+**Fix**: `add_track_point()` now returns `True`/`False`. In `process_packet`, when a point is actually added (`True`), a `track_point` SSE event is pushed with `{callsign, lat, lon, ts}`. The frontend `track_point` handler checks if a polyline already exists for the callsign — if so, it calls `getLatLngs()` and appends the new point with `setLatLngs()` (no round-trip needed). If no polyline exists yet (first/second point for a brand-new track), it triggers a single `refreshTracks()` fetch. The duplicate function definitions were also removed.
 
 ### Station cull only fired at startup
 **Symptom**: Reducing `station_max_age_days` in Settings had no immediate effect — stale stations stayed on map and list until next restart  
@@ -244,4 +266,4 @@ sudo strings /var/log/direwolf/direwolf_console.log | grep -i "gps\|fix\|timeout
 MIT
 
 ---
-*Last updated: 2026-02-18 (v2.3 — realtime station cull, filter_radius persistence, cull_loop background thread)*
+*Last updated: 2026-02-19 (v2.4 — fine-grained cull window, track storage tied to station age, Cull All button, /api/cull_all, README emoji cleanup)*

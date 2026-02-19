@@ -54,11 +54,7 @@ def _resolve_data_dir():
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 VOICEAPRS_LOG   = Path("/var/log/voiceaprs-messages.log")
 MAX_STATIONS    = 500
-TRACK_MAX_AGE   = 7 * 86400   # 7 days track history
-TRACK_MAX_PTS   = 2016        # ~7 days at 5-min intervals per station
-STATION_MAX_AGE = 7 * 86400   # 7 days in seconds
-TRACK_MAX_AGE   = 7 * 86400   # 7 days of track history
-TRACK_MAX_PTS   = 2016        # ~7 days at 5-min intervals per station
+TRACK_MAX_PTS   = 2016        # max points per track (2016 @ 5-min intervals ≈ 7 days)
 DEFAULT_FILTER_RADIUS = 50    # km
 
 logging.basicConfig(
@@ -84,7 +80,7 @@ state = {
     "aprs_is_connected":   False,
     "agw_connected":       False,
     "tracks":              {},      # callsign -> list of {lat,lon,ts}
-    "station_max_age_days": 7,      # cull stations not heard within this many days
+    "station_max_age_hours": 168,   # cull stations not heard within this window (hours)
 }
 state_lock = threading.Lock()
 
@@ -103,17 +99,21 @@ def ensure_data_dir():
 def load_pawprint_cfg():
     """Load Pawprint-specific settings from pawprint.json and apply to state.
     Falls back to defaults if the file doesn't exist yet.
+    Handles migration from old station_max_age_days key.
     """
     try:
         with open(PAWPRINT_CFG) as f:
             cfg = json.load(f)
         with state_lock:
-            if "station_max_age_days" in cfg:
-                state["station_max_age_days"] = max(1, int(cfg["station_max_age_days"]))
+            if "station_max_age_hours" in cfg:
+                state["station_max_age_hours"] = max(1, int(cfg["station_max_age_hours"]))
+            elif "station_max_age_days" in cfg:
+                # Migrate from old key
+                state["station_max_age_hours"] = max(1, int(cfg["station_max_age_days"])) * 24
             if "filter_radius" in cfg:
                 state["filter_radius"] = max(10, int(cfg["filter_radius"]))
-        log.info("Loaded pawprint config: station_max_age_days=%d filter_radius=%d",
-                 state["station_max_age_days"], state["filter_radius"])
+        log.info("Loaded pawprint config: station_max_age_hours=%d filter_radius=%d",
+                 state["station_max_age_hours"], state["filter_radius"])
     except FileNotFoundError:
         pass  # first run — defaults stay in place
     except Exception as e:
@@ -123,8 +123,8 @@ def save_pawprint_cfg():
     """Persist Pawprint-specific settings to pawprint.json."""
     with state_lock:
         cfg = {
-            "station_max_age_days": state["station_max_age_days"],
-            "filter_radius":        state["filter_radius"],
+            "station_max_age_hours": state["station_max_age_hours"],
+            "filter_radius":         state["filter_radius"],
         }
     try:
         with open(PAWPRINT_CFG, "w") as f:
@@ -140,7 +140,7 @@ def load_stations():
             data = json.load(f)
         now = time.time()
         with state_lock:
-            max_age = state["station_max_age_days"] * 86400
+            max_age = state["station_max_age_hours"] * 3600
             for call, s in data.items():
                 age = now - s.get("last_heard_ts", 0)
                 if age < max_age:
@@ -167,18 +167,19 @@ def save_stations():
         log.warning("Could not save stations: %s", e)
 
 def cull_stations():
-    """Remove stations older than station_max_age_days from the live state,
-    push a station_remove SSE event for each one, then persist to disk.
+    """Remove stations older than station_max_age_hours from the live state,
+    push a station_remove SSE event for each one, prune their tracks, then persist.
     Safe to call at any time — from the API handler or the background cull thread.
     Returns the number of stations removed.
     """
     with state_lock:
-        max_age = state["station_max_age_days"] * 86400
+        max_age = state["station_max_age_hours"] * 3600
         cutoff  = time.time() - max_age
         stale   = [call for call, s in state["stations"].items()
                    if s.get("last_heard_ts", 0) < cutoff]
         for call in stale:
             del state["stations"][call]
+            state["tracks"].pop(call, None)
 
     for call in stale:
         push_event("station_remove", {"callsign": call})
@@ -186,6 +187,7 @@ def cull_stations():
     if stale:
         log.info("Culled %d stale station(s): %s", len(stale), ", ".join(stale))
         save_stations()
+        save_tracks()
 
     return len(stale)
 
@@ -230,7 +232,9 @@ def load_tracks():
     try:
         with open(TRACKS_FILE) as f:
             data = json.load(f)
-        cutoff = time.time() - TRACK_MAX_AGE
+        with state_lock:
+            max_age = state["station_max_age_hours"] * 3600
+        cutoff = time.time() - max_age
         with state_lock:
             for call, pts in data.items():
                 fresh = [p for p in pts if p.get("ts", 0) > cutoff]
@@ -251,19 +255,23 @@ def save_tracks():
         log.warning("Could not save tracks: %s", e)
 
 def add_track_point(callsign, lat, lon, ts):
-    """Append a position fix to a station's track. Skips duplicates, trims old points."""
+    """Append a position fix to a station's track. Skips duplicates, trims old points.
+    Returns True if a new point was added, False if it was a duplicate skip.
+    """
     with state_lock:
         pts = state["tracks"].get(callsign, [])
         if pts:
             last = pts[-1]
             if abs(last["lat"] - lat) < 0.0001 and abs(last["lon"] - lon) < 0.0001:
-                return  # same location, skip
+                return False  # same location, skip
         pts.append({"lat": lat, "lon": lon, "ts": ts})
-        cutoff = ts - TRACK_MAX_AGE
+        max_age = state["station_max_age_hours"] * 3600
+        cutoff = ts - max_age
         pts = [p for p in pts if p["ts"] > cutoff]
         if len(pts) > TRACK_MAX_PTS:
             pts = pts[-TRACK_MAX_PTS:]
         state["tracks"][callsign] = pts
+    return True
 
 
 # ─── SSE Helpers ──────────────────────────────────────────────────────────────
@@ -428,8 +436,10 @@ def process_packet(raw: str):
 
     # Record position in track history if we have a fix
     if lat is not None and lon is not None:
-        add_track_point(from_call, lat, lon, now_ts)
-        save_tracks()
+        added = add_track_point(from_call, lat, lon, now_ts)
+        if added:
+            push_event("track_point", {"callsign": from_call, "lat": lat, "lon": lon, "ts": now_ts})
+            save_tracks()
 
     save_stations()
     push_event("station", station)
@@ -456,7 +466,7 @@ def aprs_is_thread():
             # Login
             login_str = (
                 f"user {MYCALL} pass {APRS_IS_PASS} "
-                f"vers pawprint 2.3 filter r/41.54/-87.14/{DEFAULT_FILTER_RADIUS}\r\n"
+                f"vers pawprint 2.4 filter r/41.54/-87.14/{DEFAULT_FILTER_RADIUS}\r\n"
             )
             sock.sendall(login_str.encode())
             log.info("APRS-IS login sent")
@@ -809,9 +819,9 @@ def api_status():
             "agw_connected":       state["agw_connected"],
             "station_count":       len(state["stations"]),
             "own_position":        state["own_position"],
-            "filter_radius":       state["filter_radius"],
-            "filter_center":       state["filter_center"],
-            "station_max_age_days": state["station_max_age_days"],
+            "filter_radius":        state["filter_radius"],
+            "filter_center":        state["filter_center"],
+            "station_max_age_hours": state["station_max_age_hours"],
         })
 
 @app.route("/api/stations")
@@ -876,6 +886,24 @@ def api_send_message():
     threading.Thread(target=do_send, daemon=True).start()
     return jsonify({"ok": True, "msg_id": msg_id})
 
+@app.route("/api/cull_all", methods=["POST"])
+def api_cull_all():
+    """Remove ALL heard stations and their tracks from live state immediately."""
+    with state_lock:
+        all_calls = list(state["stations"].keys())
+        state["stations"].clear()
+        state["tracks"].clear()
+
+    for call in all_calls:
+        push_event("station_remove", {"callsign": call})
+
+    if all_calls:
+        save_stations()
+        save_tracks()
+        log.info("Cull all: removed %d station(s)", len(all_calls))
+
+    return jsonify({"ok": True, "removed": len(all_calls)})
+
 @app.route("/api/config")
 def api_config():
     return jsonify(read_config())
@@ -886,18 +914,18 @@ def api_config_post():
     pawprint_cfg_changed = False
 
     # Pawprint-specific settings — handled here, not written to direwolf.conf
-    if "station_max_age_days" in updates:
+    if "station_max_age_hours" in updates:
         try:
-            days = max(1, int(updates["station_max_age_days"]))
+            hours = max(1, int(updates["station_max_age_hours"]))
             with state_lock:
-                state["station_max_age_days"] = days
+                state["station_max_age_hours"] = hours
             pawprint_cfg_changed = True
-            log.info("station_max_age_days updated to %d", days)
+            log.info("station_max_age_hours updated to %d", hours)
             # Apply immediately — evict stale stations from live state right now
             culled = cull_stations()
             log.info("Immediate cull after age change: removed %d station(s)", culled)
         except (ValueError, TypeError):
-            return jsonify({"ok": False, "error": "station_max_age_days must be an integer"}), 400
+            return jsonify({"ok": False, "error": "station_max_age_hours must be an integer"}), 400
 
     # If filter radius changed, update state AND push new filter immediately
     if "filter_radius" in updates:
@@ -1003,10 +1031,12 @@ def api_restart_direwolf():
 @app.route("/api/tracks")
 def api_tracks():
     """Track history for all stations, filtered by max_age seconds."""
+    with state_lock:
+        default_age = state["station_max_age_hours"] * 3600
     try:
-        max_age = float(request.args.get("max_age", TRACK_MAX_AGE))
+        max_age = float(request.args.get("max_age", default_age))
     except (ValueError, TypeError):
-        max_age = TRACK_MAX_AGE
+        max_age = default_age
     cutoff = time.time() - max_age
     with state_lock:
         result = {
@@ -1138,7 +1168,7 @@ def direwolf_log_thread():
 def startup():
     _resolve_data_dir()   # pick writable data dir before anything else
     ensure_data_dir()
-    load_pawprint_cfg()   # load station_max_age_days + filter_radius before loading stations
+    load_pawprint_cfg()   # load station_max_age_hours + filter_radius before loading stations
     load_stations()
     load_messages()
     load_tracks()
