@@ -1344,8 +1344,34 @@ function applyStationAge() {
 }
 
 function cullAll() {
-  if (!confirm("Remove all heard stations from the list? This cannot be undone.")) return;
-  fetch(BASE + "/api/cull_all", { method: "POST" })
+  const btn = document.querySelector('[onclick="cullAll()"]');
+  if (!btn) return;
+
+  if (btn.dataset.armed !== "1") {
+    // First tap: arm the button
+    btn.dataset.armed = "1";
+    const originalText = btn.textContent;
+    btn.textContent = "Confirm?";
+    btn.style.outline = "2px solid #fff";
+    const reset = () => {
+      btn.dataset.armed = "0";
+      btn.textContent = originalText;
+      btn.style.outline = "";
+    };
+    btn._cullTimer = setTimeout(reset, 3000);
+    return;
+  }
+
+  // Second tap: execute
+  clearTimeout(btn._cullTimer);
+  btn.dataset.armed = "0";
+  btn.textContent = "Cull All";
+  btn.style.outline = "";
+
+  fetch(BASE + "/api/cull_all", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"}
+  })
     .then(r => r.json())
     .then(res => {
       if (res.ok) {
