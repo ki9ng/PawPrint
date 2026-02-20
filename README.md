@@ -1,6 +1,6 @@
 # Pawprint APRS Web Interface
 
-**v2.4** — A mobile-friendly APRS web interface for Raspberry Pi running alongside Direwolf and AllStarLink 3. Monitor heard stations in real-time, track your GPS position on a map, send APRS messages, and configure beaconing from your browser.
+**v2.5** — A mobile-friendly APRS web interface for Raspberry Pi running alongside Direwolf and AllStarLink 3. Monitor heard stations in real-time, track your GPS position on a map, send APRS messages, and configure beaconing from your browser.
 
 ## Features
 
@@ -55,7 +55,7 @@ sudo systemctl restart direwolf
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/pawprint.git
+git clone https://github.com/ki9ng/pawprint.git
 cd pawprint
 sudo bash install.sh
 ```
@@ -132,6 +132,9 @@ sudo bash update.sh
 `update.sh` automatically preserves your callsign, APRS passcode, and web path from the running installation, copies the new files, and restarts the service. A timestamped backup of your old `app.py` is saved to `/opt/pawprint/`.
 
 ## Changelog
+
+### v2.5
+- **Fix: APRS Object packet stations show wrong callsign** -- Gated objects (Winlink RMS gateways, weather stations via hubs, etc.) were displayed with the transmitting gateway callsign (e.g. "WINLINK") instead of the actual object name (e.g. "W9ML-10"). Fixed by reading `object_name` from aprslib parse result, with raw-packet fallback. Gateway callsign stored separately in station record. Objects are correctly excluded from track history (fixed infrastructure doesn't move).
 
 ### v2.4
 - **Added: Fine-grained station cull window** -- Settings now uses a select with options from 1 hour to 30 days (replaces integer day input). State and config file use `station_max_age_hours` internally.

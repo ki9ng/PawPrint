@@ -348,6 +348,22 @@ def process_packet(raw: str):
     symbol_c  = parsed.get("symbol",       ">")
     pkt_type  = parsed.get("format",       "unknown")
 
+    # ── APRS Object packet handling ────────────────────────────────────────
+    # Object packets (format=="object") use the transmitting gateway as FROM,
+    # but the real station identity is the object_name embedded in the INFO field.
+    # e.g. WINLINK>APWL2K,...:;W9ML-10  *...  → callsign should be W9ML-10
+    # Also handle aprslib parse failure fallback: if INFO starts with ';', extract
+    # bytes 1-9 directly as the object name.
+    object_name = parsed.get("object_name", "").strip()
+    if not object_name and ":" in raw:
+        info = raw.split(":", 1)[1]
+        if info.startswith(";"):
+            object_name = info[1:10].strip()
+    is_object = bool(object_name)
+    gateway   = from_call if is_object else None
+    if is_object:
+        from_call = object_name
+
     # Fallback position parse if aprslib missed it
     if lat is None and ":" in raw:
         info = raw.split(":", 1)[1]
@@ -427,6 +443,8 @@ def process_packet(raw: str):
             "symbol_table":  symbol_t,
             "symbol":        symbol_c,
             "type":          pkt_type,
+            "is_object":     is_object,
+            "gateway":       gateway,
             "last_heard_ts": now_ts,
             "last_heard":    now_iso,
             "packet_count":  existing.get("packet_count", 0) + 1,
@@ -434,8 +452,8 @@ def process_packet(raw: str):
         }
         state["stations"][from_call] = station
 
-    # Record position in track history if we have a fix
-    if lat is not None and lon is not None:
+    # Record position in track history — objects are fixed infrastructure, skip tracks
+    if lat is not None and lon is not None and not is_object:
         added = add_track_point(from_call, lat, lon, now_ts)
         if added:
             push_event("track_point", {"callsign": from_call, "lat": lat, "lon": lon, "ts": now_ts})
